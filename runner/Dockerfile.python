@@ -1,0 +1,6 @@
+# Clean Python environment. Compilers are deliberately NOT installed, so missing
+# system build tools show up as real failures, like on a beginner's machine.
+FROM python:3.11-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*

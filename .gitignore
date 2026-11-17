@@ -1,0 +1,6 @@
+.venv/
+pycache/
+forko.db
+build-*.json
+results.csv
+.env
