@@ -15,7 +15,7 @@ try {
 } catch {
     Write-Host "Could not start the build:"
     if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message } else { Write-Host $_.Exception.Message }
-    exit 1
+    return
 }
 
 $id = $start.build_id
@@ -35,7 +35,7 @@ if ($r.note) { Write-Host "Note:    $($r.note)" }
 Write-Host ""
 if ($r.fixes.Count -gt 0) {
     Write-Host "Fixes:"
-    $r.fixes | ForEach-Object { Write-Host (" - {0} -> {1} (worked: {2})" -f $_.what_broke, $_.what_changed, $_.worked) }
+    $r.fixes | ForEach-Object { Write-Host (" - {0} -> {1} (worked: {2}, original error gone: {3})" -f $_.what_broke, $_.what_changed, $_.worked, $_.cleared) }
     Write-Host ""
 } else {
     Write-Host "Fixes: none needed or none matched"

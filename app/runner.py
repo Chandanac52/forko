@@ -11,15 +11,25 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import Version
+
 from .setup_gen import setup_commands
 
 log = logging.getLogger("forko")
 PY_IMAGE = os.getenv("FORKO_PY_IMAGE", "forko-python:3.11")
 NODE_IMAGE = os.getenv("FORKO_NODE_IMAGE", "forko-node:20")
+MEMORY = os.getenv("FORKO_MEMORY", "2g")      # container memory (tmpfs counts against it)
+WORK_SIZE = os.getenv("FORKO_WORK_SIZE", "2g")  # size of the /work scratch disk
 LOG_LIMIT = 20000
 TIMEOUTS = {"clone": 180, "install": 900, "build": 900, "test": 900}
 MARKERS = {"requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.py", "package.json", "package-lock.json"}
-PY_ENV = "cd /work/repo && python -m venv /work/venv && . /work/venv/bin/activate && python -m pip install -q --upgrade pip && "
+PY_ENV_BASE = "cd /work/repo && python -m venv /work/venv && . /work/venv/bin/activate && "
+PY_ENV = PY_ENV_BASE + "python -m pip install -q --upgrade pip && "
+# Older pip/setuptools/wheel for packages whose setup files current tools reject (e.g. gym 0.21.0).
+# PIP_CONSTRAINT is inherited by pip's isolated build environment, so the old setuptools is used there too.
+LEGACY_ENV = (PY_ENV_BASE + "python -m pip install -q 'pip<24.1' 'setuptools<=65.5.0' 'wheel<0.40' && "
+              "printf 'setuptools<=65.5.0\\nwheel<0.40\\n' > /work/constraints.txt && export PIP_CONSTRAINT=/work/constraints.txt && ")
 
 
 class Sandbox:
@@ -31,10 +41,10 @@ class Sandbox:
     def start(self):
         subprocess.run(
             ["docker", "run", "-d", "--rm", "--name", self.name,
-             "--memory", "2g", "--memory-swap", "2g", "--cpus", "2", "--pids-limit", "512",
+             "--memory", MEMORY, "--memory-swap", MEMORY, "--cpus", "2", "--pids-limit", "512",
              "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
-             "--tmpfs", "/tmp:rw,exec,size=512m", "--tmpfs", "/work:rw,exec,size=2g,uid=1000,gid=1000",
-             "--user", "1000:1000", "-e", "HOME=/work", "-e", "PIP_PROGRESS_BAR=off",
+             "--tmpfs", "/tmp:rw,exec,size=512m", "--tmpfs", f"/work:rw,exec,size={WORK_SIZE},uid=1000,gid=1000",
+             "--user", "1000:1000", "-e", "HOME=/work", "-e", "PIP_PROGRESS_BAR=off", "-e", "PIP_NO_CACHE_DIR=1",
              "-e", "PIP_DISABLE_PIP_VERSION_CHECK=1", "-e", "PYTHONUNBUFFERED=1",
              "-e", "NPM_CONFIG_PROGRESS=false", "-e", "NPM_CONFIG_UPDATE_NOTIFIER=false", "-w", "/work",
              self.image, "sleep", "3600"],
@@ -53,6 +63,47 @@ class Sandbox:
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True, timeout=30)
 
 
+PY_CANDIDATES = [v.strip() for v in os.getenv("FORKO_PY_VERSIONS", "3.10,3.11,3.12,3.13").split(",") if v.strip()]
+
+
+def _py_image(ver: str) -> str:
+    return PY_IMAGE.rsplit(":", 1)[0] + ":" + ver
+
+
+def _image_exists(image: str) -> bool:
+    try:
+        return subprocess.run(["docker", "image", "inspect", image], capture_output=True, timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
+def pick_python(out: str, tried: list) -> tuple[str, str] | None:
+    """If pip says the project needs a different Python, pick the lowest available version that satisfies it."""
+    m = re.search(r"requires a different Python: [\d.]+ not in '([^']+)'", out)
+    if not m:
+        return None
+    try:
+        spec = SpecifierSet(m.group(1))
+    except InvalidSpecifier:
+        return None
+    for ver in sorted(PY_CANDIDATES, key=Version):
+        if ver not in tried and spec.contains(Version(ver + ".99")) and _image_exists(_py_image(ver)):
+            return ver, m.group(1)
+    return None
+
+
+def remove_orphans() -> int:
+    """Remove leftover build containers (named forko-...) from a previous worker run."""
+    try:
+        r = subprocess.run(["docker", "ps", "-aq", "--filter", "name=forko-"], capture_output=True, text=True, timeout=20)
+        ids = r.stdout.split()
+        if ids:
+            subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=60)
+        return len(ids)
+    except Exception:
+        return 0
+
+
 # ---------------------------------------------------------------- fix engine
 def _py_fix(out: str, applied: set) -> dict | None:
     if re.search(r"pg_config executable not found|libpq-fe\.h", out) and "psycopg2-binary" not in applied:
@@ -63,6 +114,16 @@ def _py_fix(out: str, applied: set) -> dict | None:
                 "what_changed": "Replaced psycopg2 with the prebuilt psycopg2-binary package in requirements.txt.",
                 "pre": "cd /work/repo && " + unix, "unix": unix,
                 "windows": r"(Get-Content requirements.txt) -replace '^psycopg2(?=[=<>~!\s]|$)','psycopg2-binary' | Set-Content requirements.txt"}
+    if "'extras_require' must be a dictionary" in out and "legacy-build-tools" not in applied:
+        tools = 'python -m pip install "pip<24.1" "setuptools<=65.5.0" "wheel<0.40"'
+        return {"id": "legacy-build-tools", "phase": "after_venv", "legacy_tools": True,
+                "what_broke": "Dependency install failed: an old package could not be built (invalid 'extras_require' in its setup file).",
+                "why": "Old releases such as gym 0.21.0 have setup metadata that current pip and setuptools reject.",
+                "what_changed": "Installed with older build tools (pip<24.1, setuptools<=65.5.0, wheel<0.40), which still accept it.",
+                "unix": "\n".join([tools, r"printf 'setuptools<=65.5.0\nwheel<0.40\n' > \"$VIRTUAL_ENV/constraints.txt\"",
+                                   'export PIP_CONSTRAINT="$VIRTUAL_ENV/constraints.txt"']),
+                "windows": "\n".join([tools, "Set-Content \"$env:VIRTUAL_ENV\\constraints.txt\" 'setuptools<=65.5.0','wheel<0.40'",
+                                      '$env:PIP_CONSTRAINT = "$env:VIRTUAL_ENV\\constraints.txt"'])}
     m = re.search(r"(?:satisfies the requirement|No matching distribution found for) ([A-Za-z0-9_.\-]+)==", out)
     if m and f"unpin-{m.group(1).lower()}" not in applied:
         pkg = m.group(1)
@@ -85,6 +146,14 @@ def _node_fix(out: str, applied: set) -> dict | None:
                 "what_changed": "Installed with --legacy-peer-deps, which uses the older, more lenient resolution.",
                 "install_override": "npm install --legacy-peer-deps"}
     return None
+
+
+def _marker(fix_id: str) -> str:
+    if fix_id.startswith("unpin-"):
+        return r"(?:satisfies the requirement|No matching distribution found for) " + re.escape(fix_id[6:]) + "=="
+    return {"psycopg2-binary": r"pg_config executable not found|libpq-fe\.h",
+            "legacy-build-tools": r"'extras_require' must be a dictionary",
+            "legacy-peer-deps": "ERESOLVE"}.get(fix_id, r"(?!x)x")
 
 
 def find_fix(stack: str, out: str, applied: set) -> dict | None:
@@ -124,15 +193,17 @@ def _install_cmds(stack, files):
 
 def _install(sb, stack, files):
     """Install dependencies, applying known fixes (max 3 retries). Returns (ok, log, final_cmds, fixes)."""
-    cmds, fixes, text = _install_cmds(stack, files), [], ""
+    cmds, fixes, text, legacy = _install_cmds(stack, files), [], "", False
     for _ in range(4):
-        script = (PY_ENV + " && ".join(cmds)) if stack == "python" else "cd /work/repo && " + cmds[0]
+        script = ((LEGACY_ENV if legacy else PY_ENV) + " && ".join(cmds)) if stack == "python" else "cd /work/repo && " + cmds[0]
         code, out = sb.exec(script, TIMEOUTS["install"])
         text += out
         if code == 0:
             for f in fixes:
-                f["worked"] = True
+                f["worked"] = f["cleared"] = True
             return True, text, cmds, fixes
+        for f in fixes:  # "cleared": the error this fix targeted did not come back, even if another one did
+            f["cleared"] = not re.search(_marker(f["id"]), out, re.I)
         fix = find_fix(stack, out, {f["id"] for f in fixes})
         if not fix:
             break
@@ -140,8 +211,9 @@ def _install(sb, stack, files):
             sb.exec(fix["pre"], 60)
         if fix.get("install_override"):
             cmds = [fix["install_override"]]
+        legacy = legacy or bool(fix.get("legacy_tools"))
         text += f"\n--- Forko applied a fix: {fix['what_changed']} Retrying. ---\n"
-        fixes.append({k: v for k, v in fix.items() if k in ("id", "what_broke", "why", "what_changed", "unix", "windows")} | {"worked": False})
+        fixes.append({k: v for k, v in fix.items() if k in ("id", "what_broke", "why", "what_changed", "unix", "windows", "phase")} | {"worked": False, "cleared": False})
     return False, text, cmds, fixes
 
 
@@ -154,19 +226,39 @@ def _package_scripts(sb) -> dict:
         return {}
 
 
-def _fail(build, step):
+def _fail(build, step, log=""):
     build["status"] = "failed"
-    build["message"] = f"Failed at: {step}. See the step log for the real error."
+    if re.search(r"No space left on device|Cannot allocate memory", log or ""):
+        build["message"] = ("The install needs more disk space or memory than Forko's sandbox allows today (about 2 GB). "
+                            "This is a limit of Forko's sandbox, not necessarily a problem with the project.")
+    else:
+        build["message"] = f"Failed at: {step}. See the step log for the real error."
 
 
 def _run(build, save):
-    o, n = build["repo"]["owner"], build["repo"]["name"]
     stack, files = build["stack"], set(build["files"])
     build["status"] = "analyzing"
     s, t = _start(build, save, "Detect stack")
     _finish(build, save, s, t, "passed", f"Detected a {stack} project from: {', '.join(sorted(files & MARKERS))}")
+    ver = PY_IMAGE.rsplit(":", 1)[-1]
+    tried = [ver]
+    while True:
+        nxt = _attempt(build, save, ver, tried)
+        if not nxt:
+            return
+        ver = nxt
+        tried.append(ver)
 
-    sb = Sandbox(PY_IMAGE if stack == "python" else NODE_IMAGE, f"forko-{build['id'][:12]}")
+
+def _attempt(build, save, ver, tried):
+    """One full pass in a fresh container. Returns another Python version to retry with, or None."""
+    o, n = build["repo"]["owner"], build["repo"]["name"]
+    stack, files = build["stack"], set(build["files"])
+    build["steps"] = build["steps"][:1]
+    build["build_ran"] = build["tests_ran"] = False
+    if stack == "python":
+        build["runtime"] = f"Python {ver}"
+    sb = Sandbox(_py_image(ver) if stack == "python" else NODE_IMAGE, f"forko-{build['id'][:12]}")
     try:
         build["status"] = "building"
         sb.start()
@@ -179,9 +271,23 @@ def _run(build, save):
 
         s, t = _start(build, save, "Install dependencies")
         ok, out, cmds, fixes = _install(sb, stack, files)
-        build["fixes"], build["install_final"] = fixes, cmds
+        vfixes = build.setdefault("version_fixes", [])
+        for f in vfixes:  # the "requires a different Python" error is gone if it is not in this attempt's log
+            f["cleared"] = not re.search(r"requires a different Python", out)
+        build["fixes"], build["install_final"] = vfixes + fixes, cmds
         if _finish(build, save, s, t, "passed" if ok else "failed", out) == "failed":
-            return _fail(build, "Install dependencies")
+            alt = pick_python(out, tried) if stack == "python" else None
+            if alt:
+                new_ver, spec = alt
+                vfixes.append({"id": f"python-{new_ver}",
+                               "what_broke": f"Dependency install failed: the project requires Python {spec}, but the default environment is Python {ver}.",
+                               "why": f"The project declares Requires-Python {spec}, which Python {ver} does not satisfy.",
+                               "what_changed": f"Built and tested with Python {new_ver} instead.",
+                               "unix": None, "windows": None, "worked": False, "cleared": False})
+                return new_ver
+            return _fail(build, "Install dependencies", out)
+        for f in vfixes:
+            f["worked"] = True
 
         s, t = _start(build, save, "Build")
         if stack == "python":

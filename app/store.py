@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 
 
 def _conn():
@@ -29,3 +30,25 @@ def latest_for_repo(owner: str, name: str) -> dict | None:
         row = c.execute("SELECT data FROM builds WHERE repo=? ORDER BY created DESC LIMIT 1",
                         (f"{owner}/{name}".lower(),)).fetchone()
     return json.loads(row[0]) if row else None
+
+
+ACTIVE = ("queued", "analyzing", "building", "testing")
+
+
+def fail_unfinished(message: str) -> int:
+    """Builds still marked active when the worker starts were killed with the old worker."""
+    n = 0
+    with closing(_conn()) as c, c:
+        for bid, data in c.execute("SELECT id, data FROM builds").fetchall():
+            b = json.loads(data)
+            if b.get("status") not in ACTIVE:
+                continue
+            b["status"], b["message"] = "failed", message
+            b["finished_at"] = datetime.now(timezone.utc).isoformat()
+            for st in b.get("steps", []):
+                if st.get("status") == "running":
+                    st["status"] = "failed"
+                    st["log"] = (st.get("log") or "") + "\nInterrupted: the worker stopped during this step."
+            c.execute("UPDATE builds SET data=? WHERE id=?", (json.dumps(b), bid))
+            n += 1
+    return n

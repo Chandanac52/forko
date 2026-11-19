@@ -62,6 +62,7 @@ def inspect_repo(owner: str, repo: str) -> dict:
             lst = c.get(f"{API}/repos/{owner}/{repo}/contents")
             items = lst.json() if lst.status_code == 200 else []
             files = sorted(i["name"] for i in items if isinstance(i, dict) and i.get("type") == "file")
+            dirs = sorted(i["name"] for i in items if isinstance(i, dict) and i.get("type") == "dir")
     except httpx.HTTPError:
         raise RepoError("Could not reach GitHub. Please try again.", 502)
     return {
@@ -70,6 +71,7 @@ def inspect_repo(owner: str, repo: str) -> dict:
         "default_branch": info.get("default_branch", "main"),
         "language": info.get("language"),
         "files": files,
+        "dirs": dirs,
     }
 
 

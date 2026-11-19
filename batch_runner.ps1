@@ -19,6 +19,7 @@ param(
 function Get-Cause([string]$step, [string]$log) {
     if ($log -match 'Timed out after') { return "timeout" }
     if ($log -match 'No space left on device|Cannot allocate memory|MemoryError|\bKilled\b') { return "resource_limit" }
+    if ($log -match 'network connectivity|ReadTimeoutError|Connection (reset|broken|aborted)|Temporary failure in name resolution|IncompleteRead') { return "network_error" }
     if ($step -eq "Clone repository") { return "clone_failed" }
     if ($step -eq "Run tests") {
         if ($log -match 'ModuleNotFoundError|ImportError|Cannot find module') { return "tests_missing_dev_dependency" }
@@ -27,6 +28,7 @@ function Get-Cause([string]$step, [string]$log) {
     if ($step -eq "Build") { return "build_failed" }
     if ($log -match 'No matching distribution found|Could not find a version that satisfies|ETARGET|notarget') { return "version_not_found" }
     if ($log -match 'pg_config|gcc|cc1|Failed building wheel|could not build wheels|error: command|gyp ERR|make: not found|fatal error: .*\.h') { return "needs_system_build_tools" }
+    if ($log -match 'Failed to build|getting requirements to build wheel') { return "package_build_failed" }
     if ($log -match 'requires a different Python|Requires-Python|python_requires') { return "python_version" }
     if ($log -match 'ERESOLVE') { return "npm_peer_conflict" }
     if ($log -match 'ModuleNotFoundError|ImportError|Cannot find module') { return "missing_module" }
@@ -44,14 +46,14 @@ function Get-Tail([string]$log) {
 
 function Save-Row($url, $status, $step, $cause, $fixes, $seconds, $message, $tail) {
     $row = [pscustomobject]@{
-        repo = $url; os = $OS; status = $status; failed_step = $step; cause = $cause
+        repo = $url; build_id = $script:currentId; os = $OS; status = $status; failed_step = $step; cause = $cause
         fixes_applied = $fixes; seconds = $seconds; message = $message; error_tail = $tail
     }
     $row | Export-Csv -Path $OutFile -Append -NoTypeInformation -Encoding UTF8
     Write-Host ("  -> {0} {1} {2}" -f $status, $step, $cause)
 }
 
-if (-not (Test-Path $ListFile)) { Write-Host "List file not found: $ListFile"; exit 1 }
+if (-not (Test-Path $ListFile)) { Write-Host "List file not found: $ListFile"; return }
 $urls = Get-Content $ListFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" -and -not $_.StartsWith("#") }
 $done = @{}
 if (Test-Path $OutFile) { Import-Csv $OutFile | ForEach-Object { $done[$_.repo] = $true } }
@@ -63,6 +65,7 @@ foreach ($url in $urls) {
     if ($done.ContainsKey($url)) { Write-Host "[$i/$($urls.Count)] skip (already done): $url"; continue }
     Write-Host "[$i/$($urls.Count)] $url"
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $script:currentId = ""
 
     $id = $null
     for ($attempt = 1; $attempt -le 3 -and -not $id; $attempt++) {
@@ -82,6 +85,7 @@ foreach ($url in $urls) {
             break
         }
     }
+    if ($id) { $script:currentId = $id }
     if (-not $id) {
         if (-not (Test-Path $OutFile) -or -not ((Import-Csv $OutFile | Where-Object { $_.repo -eq $url }))) {
             Save-Row $url "rate_limited" "" "rate_limited" "" ([int]$sw.Elapsed.TotalSeconds) "Could not start the build" ""
@@ -93,7 +97,7 @@ foreach ($url in $urls) {
     while (($final -notcontains $r.status) -and ($sw.Elapsed.TotalMinutes -lt $TimeoutMin))
 
     $fixIds = ""
-    if ($r.fixes) { $fixIds = (($r.fixes | ForEach-Object { "{0}:{1}" -f $_.id, $_.worked }) -join ";") }
+    if ($r.fixes) { $fixIds = (($r.fixes | ForEach-Object { "{0}(worked={1},cleared={2})" -f $_.id, $_.worked, $_.cleared }) -join ";") }
     $step = ""; $cause = ""; $tail = ""
     if ($final -notcontains $r.status) {
         Save-Row $url "timeout_waiting" "" "timeout" $fixIds ([int]$sw.Elapsed.TotalSeconds) "Build did not finish in $TimeoutMin minutes" ""

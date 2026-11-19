@@ -9,12 +9,12 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 from . import store
 from .github import RepoError, detect_stack, inspect_repo, parse_repo_url
-from .runner import run_build
+from .runner import remove_orphans, run_build
 from .setup_gen import render_setup_file
 
 app = FastAPI(title="Forko worker", version="0.1.0")
@@ -39,6 +39,17 @@ def _rate_limit(ip: str):
     if len(q) >= PER_HOUR:
         raise HTTPException(429, "Too many builds from this address. Please try again later.")
     q.append(now)
+
+
+@app.on_event("startup")
+def _startup_cleanup():
+    store.fail_unfinished("The worker was restarted while this build was running. Please run it again.")
+    remove_orphans()
+
+
+@app.on_event("shutdown")
+def _shutdown_cleanup():
+    remove_orphans()  # stops running builds quickly so the worker can exit
 
 
 @app.get("/api/health")
@@ -72,7 +83,7 @@ def get_build(build_id: str):
     b = store.load(build_id)
     if not b:
         raise HTTPException(404, "Build not found.")
-    return {k: b.get(k) for k in PUBLIC}
+    return JSONResponse({k: b.get(k) for k in PUBLIC}, media_type="application/json; charset=utf-8")
 
 
 @app.get("/api/builds/{build_id}/setup-file")

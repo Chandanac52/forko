@@ -8,12 +8,16 @@ def setup_commands(build: dict) -> list[dict]:
             ("Enter the project folder", f"cd {n}")]
     ver = build["runtime"].split()[-1]
     if build["stack"] == "python":
-        for f in build["fixes"]:
-            if f.get("worked") and f.get("unix"):
+        applied = [f for f in build["fixes"] if f.get("worked") and f.get("unix")]
+        for f in applied:
+            if f.get("phase") != "after_venv":
                 cmds.append((f"Apply fix: {f['what_changed']}", f["windows"] if win else f["unix"]))
         cmds.append((f"Create a virtual environment ({build['runtime']})",
                      f"py -{ver} -m venv .venv" if win else f"python{ver} -m venv .venv"))
         cmds.append(("Activate it", r".venv\Scripts\Activate.ps1" if win else "source .venv/bin/activate"))
+        for f in applied:
+            if f.get("phase") == "after_venv":
+                cmds.append((f"Apply fix: {f['what_changed']}", f["windows"] if win else f["unix"]))
         for c in build["install_final"]:
             cmds.append(("Install dependencies", c))
         if build["tests_ran"]:
