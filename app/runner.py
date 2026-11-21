@@ -107,13 +107,14 @@ def remove_orphans() -> int:
 # ---------------------------------------------------------------- fix engine
 def _py_fix(out: str, applied: set) -> dict | None:
     if re.search(r"pg_config executable not found|libpq-fe\.h", out) and "psycopg2-binary" not in applied:
-        unix = r"sed -i.bak -E 's/^psycopg2([=<>~!]|[[:space:]]|$)/psycopg2-binary\1/' requirements.txt"
+        unix = (r"sed -i.bak -E -e 's/^psycopg2(-binary)?[[:space:]]*[=<>~!]=?[^ ;#]*/psycopg2-binary/' "
+                r"-e 's/^psycopg2([[:space:]]|$)/psycopg2-binary\1/' requirements.txt")
         return {"id": "psycopg2-binary",
                 "what_broke": "Dependency install failed: psycopg2 could not compile.",
                 "why": "Building psycopg2 from source needs the PostgreSQL client headers (libpq) and a C compiler, which a clean machine does not have.",
-                "what_changed": "Replaced psycopg2 with the prebuilt psycopg2-binary package in requirements.txt.",
+                "what_changed": "Replaced psycopg2 with the prebuilt psycopg2-binary package and removed its old version pin (old versions have no prebuilt files for current Python). Review this before committing it.",
                 "pre": "cd /work/repo && " + unix, "unix": unix,
-                "windows": r"(Get-Content requirements.txt) -replace '^psycopg2(?=[=<>~!\s]|$)','psycopg2-binary' | Set-Content requirements.txt"}
+                "windows": r"(Get-Content requirements.txt) -replace '^psycopg2(-binary)?\s*[=<>~!]=?[^\s;#]*','psycopg2-binary' -replace '^psycopg2(?=\s|$)','psycopg2-binary' | Set-Content requirements.txt"}
     if "'extras_require' must be a dictionary" in out and "legacy-build-tools" not in applied:
         tools = 'python -m pip install "pip<24.1" "setuptools<=65.5.0" "wheel<0.40"'
         return {"id": "legacy-build-tools", "phase": "after_venv", "legacy_tools": True,
@@ -305,7 +306,7 @@ def _attempt(build, save, ver, tried):
         build["status"] = "testing"
         s, t = _start(build, save, "Run tests")
         if stack == "python":
-            code, out = sb.exec("cd /work/repo && . /work/venv/bin/activate && pip install -q pytest && python -m pytest -q -x -p no:cacheprovider", TIMEOUTS["test"])
+            code, out = sb.exec("cd /work/repo && . /work/venv/bin/activate && pip install -q pytest && python -m pytest -q --maxfail=100 -p no:cacheprovider", TIMEOUTS["test"])
             st = "skipped" if code == 5 else "passed" if code == 0 else "failed"
             out = out + "\nNo tests were found." if code == 5 else out
         else:
@@ -316,7 +317,17 @@ def _attempt(build, save, ver, tried):
             else:
                 st, out = "skipped", "No test script in package.json."
         build["tests_ran"] = st == "passed"
-        if _finish(build, save, s, t, st, out) == "failed":
+        _finish(build, save, s, t, st, out)
+        if st == "failed":
+            m1, m2 = re.search(r"(\d+) passed", out), re.search(r"(\d+) failed", out)
+            passed, failed = (int(m1.group(1)) if m1 else 0), (int(m2.group(1)) if m2 else 0)
+            if stack == "python" and passed > 0:
+                build["tests_ran"] = True
+                build["status"] = "partially_verified"
+                build["message"] = (f"Dependencies installed and the project builds. {passed} tests passed and {failed} failed. "
+                                    "Failing tests can point to a problem in the project itself, or to something it needs that "
+                                    "Forko does not provide, such as a database.")
+                return
             return _fail(build, "Run tests")
 
         if st == "skipped":

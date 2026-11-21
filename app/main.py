@@ -67,8 +67,10 @@ def create_build(req: BuildRequest, request: Request):
         raise HTTPException(e.code, str(e))
     stack = detect_stack(info)
     if not stack:
-        raise HTTPException(422, "Forko supports Python and Node.js repositories today. No requirements.txt, "
-                                 "pyproject.toml, setup.py or package.json was found in the repository root.")
+        root = ", ".join(info["files"][:40] + [d + "/" for d in info.get("dirs", [])[:40]]) or "nothing listed"
+        raise HTTPException(422, "Forko supports Python and Node.js repositories today. No requirements.txt, pyproject.toml, "
+                                 "setup.py or package.json was found in the repository root. "
+                                 f"GitHub reports the main language as {info.get('language') or 'unknown'}. Root contains: {root}")
     build = {"id": str(uuid.uuid4()), "status": "queued", "os": req.os, "stack": stack, "files": info["files"],
              "repo": {"owner": info["owner"], "name": info["name"], "branch": info["default_branch"], "language": info["language"]},
              "steps": [], "fixes": [], "setup_commands": [], "setup_file_url": None, "verified_on": None,

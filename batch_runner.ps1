@@ -22,6 +22,7 @@ function Get-Cause([string]$step, [string]$log) {
     if ($log -match 'network connectivity|ReadTimeoutError|Connection (reset|broken|aborted)|Temporary failure in name resolution|IncompleteRead') { return "network_error" }
     if ($step -eq "Clone repository") { return "clone_failed" }
     if ($step -eq "Run tests") {
+        if ($log -match 'Name or service not known|Connection refused|could not connect to server|OperationalError|ConnectionError') { return "needs_external_service" }
         if ($log -match 'ModuleNotFoundError|ImportError|Cannot find module') { return "tests_missing_dev_dependency" }
         return "repo_tests_failed"
     }
@@ -113,10 +114,10 @@ foreach ($url in $urls) {
 
 Write-Host ""
 Write-Host "=== Summary from $OutFile ==="
-$all = Import-Csv $OutFile
+$all = @(Import-Csv $OutFile)
 Write-Host "Repos: $($all.Count)"
 $all | Group-Object status | Sort-Object Count -Descending | ForEach-Object { Write-Host (" {0,3}  {1}" -f $_.Count, $_.Name) }
 Write-Host "Causes of failure:"
 $all | Where-Object { $_.cause -ne "" } | Group-Object cause | Sort-Object Count -Descending | ForEach-Object { Write-Host (" {0,3}  {1}" -f $_.Count, $_.Name) }
-$withFix = ($all | Where-Object { $_.fixes_applied -ne "" }).Count
+$withFix = @($all | Where-Object { $_.fixes_applied -ne "" }).Count
 Write-Host "Repos where a fix was applied: $withFix"
