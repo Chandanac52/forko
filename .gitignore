@@ -1,6 +1,15 @@
+# Python virtual environment
 .venv/
-pycache/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Forko local data
 forko.db
 build-*.json
 results.csv
+
+# Environment variables and secrets
 .env
