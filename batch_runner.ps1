@@ -13,8 +13,12 @@ param(
     [string]$OutFile = "results.csv",
     [string]$OS = "linux",
     [string]$Api = "http://localhost:8000",
-    [int]$TimeoutMin = 20
+    [int]$TimeoutMin = 20,
+    [string]$ApiKey = ""
 )
+
+$headers = @{}
+if ($ApiKey) { $headers["X-API-Key"] = $ApiKey }
 
 function Get-Cause([string]$step, [string]$log) {
     if ($log -match 'Timed out after') { return "timeout" }
@@ -72,12 +76,13 @@ foreach ($url in $urls) {
     for ($attempt = 1; $attempt -le 3 -and -not $id; $attempt++) {
         try {
             $body = @{ repo_url = $url; os = $OS } | ConvertTo-Json
-            $id = (Invoke-RestMethod -Method Post -Uri "$Api/api/builds" -ContentType "application/json" -Body $body).build_id
+            $id = (Invoke-RestMethod -Method Post -Uri "$Api/api/builds" -ContentType "application/json" -Body $body -Headers $headers).build_id
         } catch {
             $code = 0
             if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
             $detail = $_.Exception.Message
             if ($_.ErrorDetails.Message) { try { $detail = ($_.ErrorDetails.Message | ConvertFrom-Json).detail } catch { $detail = $_.ErrorDetails.Message } }
+            if ($code -eq 401) { Write-Host "The API key was rejected. Stopping."; return }
             if ($code -eq 429 -or $code -eq 503) { Write-Host "  waiting 60s ($detail)"; Start-Sleep -Seconds 60; continue }
             $st = "rejected"
             if ($code -eq 404) { $st = "not_found" }
@@ -94,7 +99,7 @@ foreach ($url in $urls) {
         continue
     }
 
-    do { Start-Sleep -Seconds 5; $r = Invoke-RestMethod "$Api/api/builds/$id" }
+    do { Start-Sleep -Seconds 5; $r = Invoke-RestMethod "$Api/api/builds/$id" -Headers $headers }
     while (($final -notcontains $r.status) -and ($sw.Elapsed.TotalMinutes -lt $TimeoutMin))
 
     $fixIds = ""

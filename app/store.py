@@ -3,7 +3,7 @@ import json
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 def _conn():
@@ -52,3 +52,18 @@ def fail_unfinished(message: str) -> int:
             c.execute("UPDATE builds SET data=? WHERE id=?", (json.dumps(b), bid))
             n += 1
     return n
+
+
+def _recent(hours: int) -> list:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with closing(_conn()) as c:
+        rows = c.execute("SELECT data FROM builds WHERE created >= ?", (cutoff,)).fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+
+def count_recent(owner: str, hours: int = 24) -> int:
+    return sum(1 for b in _recent(hours) if b.get("owner") == owner)
+
+
+def count_active() -> int:
+    return sum(1 for b in _recent(3) if b.get("status") in ACTIVE)

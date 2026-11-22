@@ -1,4 +1,6 @@
 """Forko worker API. Run: uvicorn app.main:app --port 8000"""
+import hmac
+import logging
 import os
 import time
 import uuid
@@ -17,7 +19,10 @@ from .github import RepoError, detect_stack, inspect_repo, parse_repo_url
 from .runner import remove_orphans, run_build
 from .setup_gen import render_setup_file
 
-app = FastAPI(title="Forko worker", version="0.1.0")
+_DOCS_OFF = os.getenv("FORKO_DISABLE_DOCS") == "1"
+app = FastAPI(title="Forko worker", version="0.1.0",
+              **(dict(docs_url=None, redoc_url=None, openapi_url=None) if _DOCS_OFF else {}))
+log = logging.getLogger("forko")
 app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in os.getenv("FORKO_CORS_ORIGINS", "*").split(",")],
                    allow_methods=["GET", "POST"], allow_headers=["*"])
 pool = ThreadPoolExecutor(max_workers=int(os.getenv("FORKO_WORKERS", "2")))
@@ -32,6 +37,35 @@ class BuildRequest(BaseModel):
     os: Literal["windows", "macos", "linux"] = "linux"
 
 
+def _api_keys() -> dict:
+    """FORKO_API_KEYS="alice:key1,bob:key2" (label:key). Empty means auth is off (local development only)."""
+    keys = {}
+    for part in os.getenv("FORKO_API_KEYS", "").split(","):
+        if ":" in part:
+            label, key = part.split(":", 1)
+            if label.strip() and key.strip():
+                keys[label.strip()] = key.strip()
+    return keys
+
+
+def _auth(request: Request) -> str:
+    keys = _api_keys()
+    if not keys:
+        return "anonymous"
+    given = request.headers.get("x-api-key", "").encode()
+    for label, key in keys.items():
+        if hmac.compare_digest(given, key.encode()):
+            return label
+    raise HTTPException(401, "A valid API key is required. Send it in the X-API-Key header.")
+
+
+def _check_capacity(owner: str):
+    if store.count_active() >= int(os.getenv("FORKO_MAX_ACTIVE", "6")):
+        raise HTTPException(429, "Forko is busy right now. Please try again in a few minutes.")
+    if owner != "anonymous" and store.count_recent(owner) >= int(os.getenv("FORKO_DAILY_LIMIT", "20")):
+        raise HTTPException(429, "The daily build limit for this key has been reached. Please try again tomorrow.")
+
+
 def _rate_limit(ip: str):
     now, q = time.time(), HITS[ip]
     while q and now - q[0] > 3600:
@@ -43,6 +77,8 @@ def _rate_limit(ip: str):
 
 @app.on_event("startup")
 def _startup_cleanup():
+    if not _api_keys():
+        log.warning("FORKO_API_KEYS is not set: the API is open to everyone. Use this only on your own computer.")
     store.fail_unfinished("The worker was restarted while this build was running. Please run it again.")
     remove_orphans()
 
@@ -59,7 +95,9 @@ def health():
 
 @app.post("/api/builds")
 def create_build(req: BuildRequest, request: Request):
+    caller = _auth(request)
     _rate_limit(request.client.host if request.client else "unknown")
+    _check_capacity(caller)
     try:
         owner, name = parse_repo_url(req.repo_url)
         info = inspect_repo(owner, name)
@@ -71,7 +109,7 @@ def create_build(req: BuildRequest, request: Request):
         raise HTTPException(422, "Forko supports Python and Node.js repositories today. No requirements.txt, pyproject.toml, "
                                  "setup.py or package.json was found in the repository root. "
                                  f"GitHub reports the main language as {info.get('language') or 'unknown'}. Root contains: {root}")
-    build = {"id": str(uuid.uuid4()), "status": "queued", "os": req.os, "stack": stack, "files": info["files"],
+    build = {"id": str(uuid.uuid4()), "owner": caller, "status": "queued", "os": req.os, "stack": stack, "files": info["files"],
              "repo": {"owner": info["owner"], "name": info["name"], "branch": info["default_branch"], "language": info["language"]},
              "steps": [], "fixes": [], "setup_commands": [], "setup_file_url": None, "verified_on": None,
              "note": None, "message": None, "created_at": datetime.now(timezone.utc).isoformat(), "finished_at": None}
